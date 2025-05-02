@@ -1,0 +1,20 @@
+{
+  "name": "dotnet-agent",
+  "version": "1.0.0",
+  "description": "A GitHub agent that can answer and propose code changes for .NET runtime issues and PRs using a fine-tuned language model. The agent leverages context from all public .NET GitHub repositories to provide accurate and actionable responses.",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@octokit/graphql": "^8.2.2",
+    "@octokit/rest": "^21.1.1",
+    "dotenv": "^16.5.0",
+    "p-limit": "^6.2.0",
+    "p-retry": "^6.2.1"
+  }
+}
