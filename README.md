@@ -5,7 +5,7 @@ A GitHub agent that can answer and propose code changes for .NET runtime issues 
 ## Project Structure
 
 - `agent/`: Contains the core implementation of the GitHub agent.
-- `data/`: Scripts and utilities for data collection and preprocessing, including extracting issues and PRs from GitHub.
+- `github-crawler/`: Scripts and utilities for data collection and preprocessing, including extracting issues and PRs from GitHub.
 - `model/`: Code for fine-tuning and deploying the language model, including training scripts and model configurations.
 - `scripts/`: Deployment and automation.
 
@@ -15,10 +15,8 @@ A GitHub agent that can answer and propose code changes for .NET runtime issues 
 - Deploy the model as a GitHub agent on Azure.
 - Implement a feedback loop for continuous improvement.
 
-## Setup
+## Quick start
 
-1. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-
+1. Collect raw data from Github repository
+2. Generate dataset
+3. Finetune model

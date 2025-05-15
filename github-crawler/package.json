@@ -13,8 +13,11 @@
   "dependencies": {
     "@octokit/graphql": "^8.2.2",
     "@octokit/rest": "^21.1.1",
+    "delay": "^6.0.0",
     "dotenv": "^16.5.0",
     "p-limit": "^6.2.0",
-    "p-retry": "^6.2.1"
+    "p-queue": "^8.1.0",
+    "p-retry": "^6.2.1",
+    "yargs": "^17.7.2"
   }
 }
