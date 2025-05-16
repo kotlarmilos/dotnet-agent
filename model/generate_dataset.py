@@ -2,6 +2,7 @@
 import json
 from pathlib import Path
 import sys
+from transformers import AutoTokenizer
 
 def load_settings(path: Path):
     if not path.exists():
@@ -14,7 +15,7 @@ def main():
     BASE_DIR = Path(__file__).resolve().parent
     settings = load_settings(BASE_DIR / 'settings.json')
     system_instruction = settings['system_instruction']
-    model_name = settings.get('model_name')
+    model_name = settings.get('base_model')
     max_context = settings.get('max_context_size')
 
     # Define directories
@@ -22,6 +23,8 @@ def main():
     DIFF_DIR     = BASE_DIR.parent / 'data' / 'raw-data' / 'diffs'
     OUT_DIR      = BASE_DIR.parent / 'data' / 'dataset'
     OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     for snapshot_path in sorted(SNAPSHOT_DIR.glob('pr-*.json')):
         pr_data = json.loads(snapshot_path.read_text(encoding='utf-8'))
@@ -75,7 +78,7 @@ def main():
 
                 # Build user message
                 user_parts = [
-                    f"PR #{pr_number} (model={model_name}): {title}",
+                    f"PR #{pr_number}: {title}",
                     f"Description: {body}"
                 ]
                 if labels:
@@ -102,17 +105,18 @@ def main():
 
                 assistant_msg = f"Commit {oid}\nDiff:\n{diff_text}"
                 text = (
-                    "<|im_start|>system\n" + system_instruction + "\n<|im_end|>\n"
-                    "<|im_start|>user\n"   + "\n".join(user_parts) + "\n<|im_end|>\n"
-                    "<|im_start|>assistant\n" + assistant_msg + "\n<|im_end|>"
+                    "<|im_start|>system\n<|im_sep|>" + system_instruction + "\n<|im_end|>\n"
+                    "<|im_start|>user\n<|im_sep|>"   + "\n".join(user_parts) + "\n<|im_end|>\n"
+                    "<|im_start|>assistant\n<|im_sep|>" + assistant_msg + "\n<|im_end|>"
                 )
 
                 # Enforce max context size (in characters)
-                if len(text) > max_context:
-                    print(f"Skipping example for commit {oid}: context size {len(text)} > {max_context}")
-                else:
-                    lines.append(json.dumps({'text': text}, ensure_ascii=False))
-
+                tokens = tokenizer.encode(text, truncation=False)
+                if len(tokens) > max_context:
+                    print(f"Skipping commit {oid}: total length = {len(tokens)} tokens > {max_context}")
+                    continue
+                
+                lines.append(json.dumps({'text': text}, ensure_ascii=False))
             past.append((kind, ts, data))
 
         if lines:
