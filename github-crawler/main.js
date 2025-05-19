@@ -44,14 +44,32 @@ async function waitForRateLimitReset() {
   await sleep(ms + 1000);
 }
 
-// Retry wrapper
-async function withRetry(fn) {
+// Proactive rate limit check
+async function checkRateLimit(threshold = 10) {
+  const { data } = await octokit.rest.rateLimit.get();
+  const remaining = data.resources.core.remaining;
+  const reset = data.resources.core.reset * 1000;
+  if (remaining < threshold) {
+    const ms = Math.max(reset - Date.now(), 0);
+    log('WARN', `Approaching rate limit (${remaining} left). Sleeping ${Math.ceil(ms/1000)}s until ${new Date(reset).toISOString()}`);
+    await sleep(ms + 1000);
+  }
+}
+
+// Smarter retry wrapper: only retry on network/5xx or rate limit errors
+async function withSmartRetry(fn) {
   return pRetry(fn, {
     retries: 5,
     factor: 2,
     minTimeout: 1000,
     maxTimeout: 30000,
     onFailedAttempt: err => log('WARN', `Attempt #${err.attemptNumber} failed: ${err.message}`),
+    retry: err => {
+      if (/rate limit/i.test(err.message)) return true;
+      if (err.status && err.status >= 500) return true;
+      if (err.code === 'ENOTFOUND' || err.code === 'ECONNRESET') return true;
+      return false;
+    }
   });
 }
 
@@ -78,7 +96,7 @@ async function fetchConnection(prNumber, field, selection) {
   let cursor = null;
   const items = [];
   do {
-    const resp = await withRetry(() => callGh(
+    const resp = await withSmartRetry(() => callGh(
       `query($owner:String!,$repo:String!,$pr:Int!,$first:Int!,$after:String){
          repository(owner:$owner, name:$repo) {
            pullRequest(number:$pr) {
@@ -104,7 +122,7 @@ async function fetchAllPRs() {
   const prs = [];
 
   do {
-    const resp = await withRetry(() => callGh(
+    const resp = await withSmartRetry(() => callGh(
       `query($owner:String!,$repo:String!,$first:Int!,$after:String){
          repository(owner:$owner, name:$repo) {
            pullRequests(first:$first, after:$after) {
@@ -143,7 +161,8 @@ async function fetchDiff(sha) {
   const file = path.join(dir, `${sha}.diff`);
   if (fsSync.existsSync(file)) return;
 
-  await withRetry(async () => {
+  await checkRateLimit();
+  await withSmartRetry(async () => {
     try {
       const res = await octokit.request(
         'GET /repos/{owner}/{repo}/commits/{sha}',
@@ -173,11 +192,21 @@ async function processPR(pr) {
   let data;
 
   if (fsSync.existsSync(file)) {
-    log('INFO', `PR#${pr.number} snapshot exists; loading for diff`);
     const raw = await fs.readFile(file, 'utf-8');
     data = JSON.parse(raw);
+    // Check if all diffs exist
+    if (!skipDiff && data.commitsMeta) {
+      const shas = data.commitsMeta.map(c => c.commit.oid);
+      const allDiffsExist = shas.every(sha => fsSync.existsSync(path.join(outDir, 'diffs', `${sha}.diff`)));
+      if (allDiffsExist) {
+        log('INFO', `PR#${pr.number} and all diffs already processed; skipping.`);
+        return;
+      }
+    }
+    log('INFO', `PR#${pr.number} snapshot exists; loading for diff`);
   } else {
     log('INFO', `Processing PR#${pr.number}`);
+    await checkRateLimit();
     const [comments, reviewThreads, commitsMeta] = await Promise.all([
       fetchConnection(pr.number, 'comments', 'id body createdAt author{login}'),
       fetchConnection(pr.number, 'reviewThreads', 'comments(first:100){nodes{path diffHunk body createdAt author{login}}}'),
@@ -201,7 +230,7 @@ async function processPR(pr) {
     log('INFO', `Saved PR#${pr.number}`);
   }
 
-  if (!skipDiff) {
+  if (!skipDiff && data.commitsMeta) {
     const shas = data.commitsMeta.map(c => c.commit.oid);
     const dir = path.join(outDir, 'diffs');
     await ensureDir(dir);
@@ -216,7 +245,7 @@ async function processPR(pr) {
     const prs = await fetchAllPRs();
     log('INFO', `Found ${prs.length} PRs`);
 
-    const limit = pLimit(concurrency);
+    const limit = pLimit(Math.min(concurrency, 3));
     await Promise.all(prs.map(pr => limit(() => processPR(pr))));
 
     log('INFO', 'All done.');
