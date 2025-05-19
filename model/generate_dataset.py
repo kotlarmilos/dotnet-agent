@@ -87,17 +87,17 @@ def main():
                 # Add past events into context
                 for pkind, _, pdat in past:
                     if pkind == 'comment':
-                        author = pdat.get('author',{}).get('login','user')
-                        user_parts.append(f"Comment by {author}: {pdat.get('body','')}")
+                        author = (pdat or {}).get('author',{}).get('login','user')
+                        user_parts.append(f"Comment by {author}: {pdat.get('body','') if pdat else ''}")
                     elif pkind == 'review':
-                        author = pdat.get('author',{}).get('login','reviewer')
-                        path   = pdat.get('path','')
-                        hunk   = pdat.get('diffHunk','').strip()
+                        author = (pdat or {}).get('author',{}).get('login','reviewer')
+                        path   = pdat.get('path','') if pdat else ''
+                        hunk   = pdat.get('diffHunk','').strip() if pdat else ''
                         user_parts.append(
-                            f"Review by {author} on {path}: {pdat.get('body','')}\nDiff hunk:\n{hunk}"
+                            f"Review by {author} on {path}: {pdat.get('body','') if pdat else ''}\nDiff hunk:\n{hunk}"
                         )
                     elif pkind == 'commit':
-                        prev = pdat['commit']
+                        prev = pdat['commit'] if pdat and 'commit' in pdat else {}
                         user_parts.append(
                             f"Previous commit {prev.get('oid','')} – {prev.get('message','')}\n"
                             f"Diff:\n{prev.get('diff','')}"
