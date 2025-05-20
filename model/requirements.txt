@@ -8,3 +8,4 @@ faiss-cpu
 fastapi
 uvicorn
 langchain-community
+tqdm
