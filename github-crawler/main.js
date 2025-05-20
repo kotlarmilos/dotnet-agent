@@ -7,251 +7,273 @@ import path from 'path';
 import pLimit from 'p-limit';
 import pRetry from 'p-retry';
 import { promisify } from 'util';
-import yargs from 'yargs';
-import { hideBin } from 'yargs/helpers';
+import cliProgress from 'cli-progress';
+import settings from '../settings.json' assert { type: 'json' };
 
-// Load environment
 dotenv.config();
 const TOKEN = process.env.GITHUB_TOKEN;
 if (!TOKEN) throw new Error('Missing GITHUB_TOKEN');
 
-// CLI configuration
-const argv = yargs(hideBin(process.argv))
-  .option('owner',       { type: 'string', demandOption: true, describe: 'GitHub repo owner' })
-  .option('repo',        { type: 'string', demandOption: true, describe: 'GitHub repo name' })
-  .option('outDir',      { type: 'string', default: 'output', describe: 'Base output directory' })
-  .option('concurrency', { type: 'number', default: 5, describe: 'Max parallel requests' })
-  .option('maxPrs',      { type: 'number', describe: 'Limit to first N PRs for testing' })
-  .option('skipDiff',    { type: 'boolean', default: false, describe: 'Skip fetching diffs' })
-  .argv;
+const owner = settings.repository.replace("https://github.com/", "").split('/')[0];
+const repo = settings.repository.replace("https://github.com/", "").split('/')[1];
+const outDir = 'data/raw-data';
+const limit = Number.MAX_SAFE_INTEGER;
 
-const { owner, repo, outDir, concurrency, maxPrs, skipDiff } = argv;
 const octokit = new Octokit({ auth: TOKEN });
-const gh = graphql.defaults({ headers: { authorization: `token ${TOKEN}` } });
-const sleep = promisify(setTimeout);
+const gh      = graphql.defaults({ headers: { authorization: `token ${TOKEN}` } });
+const sleep   = promisify(setTimeout);
 
-// Logging helper
 function log(level, msg) {
   console.log(`[${new Date().toISOString()}] [${level}] ${msg}`);
 }
 
-// Rate-limit handling
-async function waitForRateLimitReset() {
+async function ensureDir(dir) {
+  await fs.mkdir(dir, { recursive: true });
+}
+
+async function getRateLimit() {
   const { data } = await octokit.rest.rateLimit.get();
-  const reset = data.resources.core.reset * 1000;
-  const ms = Math.max(reset - Date.now(), 0);
-  log('WARN', `Rate limit hit. Sleeping ${Math.ceil(ms/1000)}s until ${new Date(reset).toISOString()}`);
+  const core = data.resources.core;
+  return {
+    remaining: core.remaining,
+    resetAt:   core.reset * 1000,
+    window:    core.reset * 1000 - Date.now()
+  };
+}
+
+function msToHMS(ms) {
+  const s   = Math.ceil(ms/1000);
+  const h   = Math.floor(s/3600);
+  const m   = Math.floor((s%3600)/60);
+  const sec = s%60;
+  return `${h}h ${m}m ${sec}s`;
+}
+
+async function waitForRateLimitReset() {
+  const { resetAt } = await getRateLimit();
+  const ms = Math.max(resetAt - Date.now(), 0);
+  log('WARN', `Rate limit hit; sleeping ${msToHMS(ms)}`);
   await sleep(ms + 1000);
 }
 
-// Proactive rate limit check
 async function checkRateLimit(threshold = 10) {
-  const { data } = await octokit.rest.rateLimit.get();
-  const remaining = data.resources.core.remaining;
-  const reset = data.resources.core.reset * 1000;
+  const { remaining, resetAt } = await getRateLimit();
   if (remaining < threshold) {
-    const ms = Math.max(reset - Date.now(), 0);
-    log('WARN', `Approaching rate limit (${remaining} left). Sleeping ${Math.ceil(ms/1000)}s until ${new Date(reset).toISOString()}`);
+    const ms = Math.max(resetAt - Date.now(), 0);
+    log('WARN', `Approaching rate limit (${remaining} left); sleeping ${msToHMS(ms)}`);
     await sleep(ms + 1000);
   }
 }
 
-// Smarter retry wrapper: only retry on network/5xx or rate limit errors
 async function withSmartRetry(fn) {
   return pRetry(fn, {
     retries: 5,
     factor: 2,
     minTimeout: 1000,
     maxTimeout: 30000,
-    onFailedAttempt: err => log('WARN', `Attempt #${err.attemptNumber} failed: ${err.message}`),
-    retry: err => {
-      if (/rate limit/i.test(err.message)) return true;
-      if (err.status && err.status >= 500) return true;
-      if (err.code === 'ENOTFOUND' || err.code === 'ECONNRESET') return true;
-      return false;
-    }
+    onFailedAttempt: e => log('WARN', `Attempt #${e.attemptNumber} failed: ${e.status}`),
+    retry: e =>
+      (/rate limit/i.test(e.message)) ||
+      (e.status >= 500) ||
+      ['ECONNRESET','ENOTFOUND'].includes(e.code)
   });
 }
 
-// Ensure directory exists
-async function ensureDir(dir) {
-  await fs.mkdir(dir, { recursive: true });
-}
-
-// GraphQL helper with rate-limit handling
-async function callGh(query, variables) {
+async function callGh(query, vars) {
   try {
-    return await gh(query, variables);
+    return await gh(query, vars);
   } catch (err) {
     if (/rate limit/i.test(err.message)) {
       await waitForRateLimitReset();
-      return gh(query, variables);
+      return await gh(query, vars);
     }
     throw err;
   }
 }
 
-// Fetch a paginated connection from GraphQL
-async function fetchConnection(prNumber, field, selection) {
-  let cursor = null;
-  const items = [];
+const STATE_FILE = path.join(outDir, 'state.json');
+let state = { prsDone: [], diffsDone: [], errors: [] };
+try {
+  state = JSON.parse(fsSync.readFileSync(STATE_FILE, 'utf-8'));
+} catch {}
+function saveState() {
+  fsSync.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+}
+
+async function fetchConnection(owner, repo, prNumber, field, selection) {
+  let cursor = null, nodes = [];
   do {
-    const resp = await withSmartRetry(() => callGh(
-      `query($owner:String!,$repo:String!,$pr:Int!,$first:Int!,$after:String){
-         repository(owner:$owner, name:$repo) {
-           pullRequest(number:$pr) {
-             ${field}(first:$first, after:$after) {
-               pageInfo { hasNextPage endCursor }
-               nodes { ${selection} }
+    const resp = await withSmartRetry(() =>
+      callGh(
+        `query($owner:String!,$repo:String!,$pr:Int!,$first:Int!,$after:String){
+           repository(owner:$owner,name:$repo){
+             pullRequest(number:$pr){
+               ${field}(first:$first,after:$after){
+                 pageInfo{ hasNextPage endCursor }
+                 nodes{ ${selection} }
+               }
              }
            }
-         }
-       }`,
-      { owner, repo, pr: prNumber, first: 100, after: cursor }
-    ));
+         }`,
+        { owner, repo, pr: prNumber, first: 100, after: cursor }
+      )
+    );
     const conn = resp.repository.pullRequest[field];
-    items.push(...conn.nodes);
-    cursor = conn.pageInfo.endCursor;
+    nodes.push(...conn.nodes);
+    cursor = conn.pageInfo.hasNextPage ? conn.pageInfo.endCursor : null;
   } while (cursor);
-  return items;
+  return nodes;
 }
 
-// Fetch list of PRs with metadata
-async function fetchAllPRs() {
-  let cursor = null;
-  const prs = [];
-
-  do {
-    const resp = await withSmartRetry(() => callGh(
-      `query($owner:String!,$repo:String!,$first:Int!,$after:String){
-         repository(owner:$owner, name:$repo) {
-           pullRequests(first:$first, after:$after) {
-             pageInfo { hasNextPage endCursor }
-             nodes {
-               number
-               title
-               body
-               createdAt
-               labels(first:10){ nodes { name } }
+async function fetchAllPRs(owner, repo, limit) {
+  if (!state.cursor) {
+    const repoInfo = await callGh(`query($owner:String!,$repo:String!){repository(owner:$owner,name:$repo){pullRequests{totalCount}}}`, { owner, repo });
+    state.totalPRs = limit ? Math.min(limit, repoInfo.repository.pullRequests.totalCount) : repoInfo.repository.pullRequests.totalCount;
+    state.cursor = null;
+    state.processedPRs = 0;
+    state.prsCompleted = [];
+    state.prsPending = [];
+    saveState();
+  }
+  const bar = new cliProgress.SingleBar({
+    format: 'Fetching PRs |{bar}| {value}/{total} PRs',
+    hideCursor: true
+  }, cliProgress.Presets.shades_classic);
+  bar.start(limit ? Math.min(limit, state.totalPRs) : state.totalPRs, state.processedPRs);
+  while (state.processedPRs < limit && (state.cursor || state.processedPRs === 0)) {  
+    const resp = await withSmartRetry(() =>
+      callGh(
+        `query($owner:String!,$repo:String!,$first:Int!,$after:String){
+           repository(owner:$owner,name:$repo){
+             pullRequests(first:$first,after:$after,orderBy:{field:CREATED_AT,direction:DESC}){
+               pageInfo{ hasNextPage endCursor }
+               nodes{
+                 number title body createdAt closedAt mergedAt state author{login}
+                 labels(first:10){ nodes{ name }}
+                 headRefName additions deletions changedFiles
+                 comments(first:100) { totalCount nodes { body createdAt } }
+                 reviewThreads(first:100) { totalCount nodes { comments(first:20) { nodes { path diffHunk body createdAt }}}}
+                 commits(first:100) { totalCount nodes { commit { oid message committedDate }}}
+               }
              }
            }
-         }
-       }`,
-      { owner, repo, first: 100, after: cursor }
-    ));
-
+         }`,
+        { owner, repo, first: 100, after: state.cursor }
+      )
+    );
     const conn = resp.repository.pullRequests;
-    prs.push(...conn.nodes.map(n => ({
-      number:    n.number,
-      title:     n.title,
-      body:      n.body,
-      createdAt: n.createdAt,
-      labels:    n.labels.nodes.map(l => l.name)
-    })));
-
-    cursor = conn.pageInfo.endCursor;
-  } while (cursor && prs.length < (maxPrs || Infinity));
-
-  return maxPrs ? prs.slice(0, maxPrs) : prs;
+    for (const pr of conn.nodes) {
+      const prFile = path.join(outDir, 'prs', `pr-${pr.number}.json`);
+      if (!fsSync.existsSync(prFile)) {
+        await fs.writeFile(prFile, JSON.stringify(pr, null, 2));
+      if (pr.comments.totalCount == pr.comments.nodes.length
+          && pr.reviewThreads.totalCount == pr.reviewThreads.nodes.length
+          && pr.commits.totalCount == pr.commits.nodes.length) {
+            state.prsCompleted.push(pr.number);
+          }else {
+            state.prsPending.push(pr.number);
+          }
+      }
+    }
+    state.processedPRs += conn.nodes.length;
+    state.cursor = conn.pageInfo.hasNextPage ? conn.pageInfo.endCursor : null;
+    saveState();
+    bar.update(state.processedPRs);
+  };
+  bar.stop();
 }
 
-// Fetch diff for a commit SHA
-async function fetchDiff(sha) {
-  const dir = path.join(outDir, 'diffs');
-  const file = path.join(dir, `${sha}.diff`);
-  if (fsSync.existsSync(file)) return;
+async function fetchMissingDetails(pr) {
+  const outFile = path.join(outDir, 'prs', `pr-${pr}.json`);
+  const prData = JSON.parse(await fs.readFile(outFile, 'utf-8'));
 
+  const commentCount = prData.comments?.totalCount || 0;
+  const reviewCount  = prData.reviewThreads?.totalCount || 0;
+  const commitCount  = prData.commits?.totalCount || 0;
+
+  const fetchedCommentCount = prData.comments?.nodes?.length || 0;
+  const fetchedReviewCount  = prData.reviewThreads?.nodes?.length || 0;
+  const fetchedCommitCount  = prData.commits?.nodes?.length || 0;
+
+  if (fetchedCommentCount < commentCount) {
+    prData.comments.nodes = await fetchConnection(owner, repo, pr.number, 'comments', 'body createdAt');
+  }
+  if (fetchedReviewCount < reviewCount) {
+    prData.reviewThreads.nodes = await fetchConnection(owner, repo, pr.number, 'reviewThreads', 'comments(first:100) { nodes { path diffHunk body createdAt } }');
+  }
+  if (fetchedCommitCount < commitCount) {
+    prData.commits.nodes = await fetchConnection(owner, repo, pr.number, 'commits', 'commit { oid message committedDate }');
+  }
+
+  await fs.writeFile(outFile, JSON.stringify(prData, null, 2));
+}
+
+async function fetchCommitDiff(owner, repo, sha) {
   await checkRateLimit();
-  await withSmartRetry(async () => {
-    try {
-      const res = await octokit.request(
-        'GET /repos/{owner}/{repo}/commits/{sha}',
-        { owner, repo, sha, headers: { accept: 'application/vnd.github.v3.diff' } }
-      );
-      await ensureDir(dir);
-      await fs.writeFile(file, res.data);
-      log('INFO', `Saved diff ${sha}`);
-    } catch (err) {
-      if (/rate limit/i.test(err.message)) {
-        await waitForRateLimitReset();
-        throw err;
-      }
-      if (err.status >= 400 && err.status < 500) {
-        log('WARN', `Skipping diff ${sha}: Error code ${err.status}`);
-        return;
-      }
-      throw err;
-    }
-  });
+  const res = await withSmartRetry(() =>
+    octokit.request('GET /repos/{owner}/{repo}/commits/{sha}', {
+      owner, repo, sha
+    })
+  );
+  return res.data;
 }
 
-// Phase 1: Fetch and save all PR metadata
-async function fetchAndSaveAllPRs() {
+async function main() {
+  // Create output directories
   await ensureDir(path.join(outDir, 'prs'));
-  const prs = await fetchAllPRs();
-  log('INFO', `Found ${prs.length} PRs`);
-  for (const pr of prs) {
-    try {
-      await checkRateLimit();
-      const [comments, reviewThreads, commitsMeta] = await Promise.all([
-        fetchConnection(pr.number, 'comments', 'id body createdAt author{login}'),
-        fetchConnection(pr.number, 'reviewThreads', 'comments(first:100){nodes{path diffHunk body createdAt author{login}}}'),
-        fetchConnection(pr.number, 'commits', 'commit{oid message committedDate}')
-      ]);
-      const reviewComments = reviewThreads.flatMap(t => t.comments.nodes);
-      const data = {
-        prNumber:   pr.number,
-        title:      pr.title,
-        body:       pr.body,
-        createdAt:  pr.createdAt,
-        labels:     pr.labels,
-        comments,
-        reviewComments,
-        commitsMeta
-      };
-      const file = path.join(outDir, 'prs', `pr-${pr.number}.json`);
-      await fs.writeFile(file, JSON.stringify(data, null, 2));
-      log('INFO', `Saved PR#${pr.number}`);
-    } catch (err) {
-      log('ERROR', `Failed to fetch/save PR#${pr.number}: ${err.message}`);
-    }
-  }
-}
+  await ensureDir(path.join(outDir, 'diffs'));
 
-// Phase 2: Fetch all commit diffs for all PRs
-async function fetchAllDiffs() {
-  const prsDir = path.join(outDir, 'prs');
-  const diffDir = path.join(outDir, 'diffs');
-  await ensureDir(diffDir);
-  const files = fsSync.readdirSync(prsDir).filter(f => f.startsWith('pr-') && f.endsWith('.json'));
-  const limit = pLimit(concurrency);
-  for (const file of files) {
-    let data;
-    try {
-      data = JSON.parse(fsSync.readFileSync(path.join(prsDir, file), 'utf-8'));
-    } catch (err) {
-      log('ERROR', `Failed to read/parse ${file}: ${err.message}`);
-      continue;
-    }
-    if (!data.commitsMeta) continue;
-    const shas = data.commitsMeta.map(c => c.commit.oid);
-    await Promise.all(shas.map(sha => limit(async () => {
+  // Fetch PRs
+  await fetchAllPRs(owner, repo, limit);
+  log('INFO', `Fetched ${state.totalPRs} PRs`);
+
+  // Fetch missing PR data
+  let bar = new cliProgress.SingleBar({
+    format: 'Fetching PR details |{bar}| {value}/{total} PRs',
+    hideCursor: true
+  }, cliProgress.Presets.shades_classic);
+  bar.start(state.prsPending.length, 0);
+  while (state.prsPending.length > 0) {
+    const pr = state.prsPending.pop();
+    await fetchMissingDetails(pr);
+    state.prsCompleted.push(pr);
+    saveState();
+    bar.increment();
+  }
+  bar.stop();
+
+  // Fetch commit diffs
+  bar = new cliProgress.SingleBar({
+    format: 'Fetching commit diffs |{bar}| {value}/{total} PRs',
+    hideCursor: true
+  }, cliProgress.Presets.shades_classic);
+  bar.start(state.prsCompleted.length, 0);
+  while (state.prsCompleted.length > 0) {
+    const pr = state.prsCompleted.pop();
+    const prFile = path.join(outDir, 'prs', `pr-${pr}.json`);
+    const prData = JSON.parse(await fs.readFile(prFile, 'utf-8'));
+    const commits = prData.commits?.nodes || [];
+
+    for (const entry of commits) {
+      const sha = entry.commit.oid;
+      const diffFile = path.join(outDir, 'diffs', `${sha}.json`);
+      if (fsSync.existsSync(diffFile)) continue;
+
       try {
-        await fetchDiff(sha);
+        const data = await fetchCommitDiff(owner, repo, sha);
+        await fs.writeFile(diffFile, JSON.stringify(data, null, 2));
       } catch (err) {
-        log('ERROR', `Failed to fetch diff for ${sha} in ${file}: ${err.message}`);
+        log('ERROR', `Failed to fetch diff for ${sha}: ${err.message}`);
       }
-    })));
+    }
+
+    saveState();
+    bar.increment();
   }
+
+  bar.stop();
+
+  log('INFO', 'All phases complete.');
 }
 
-(async () => {
-  try {
-    await fetchAndSaveAllPRs();
-    await fetchAllDiffs();
-    log('INFO', 'All done.');
-  } catch (err) {
-    log('ERROR', err.message);
-    process.exit(1);
-  }
-})();
+main();
