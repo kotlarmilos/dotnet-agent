@@ -185,69 +185,70 @@ async function fetchDiff(sha) {
   });
 }
 
-// Process single PR: always check diffs even if snapshot exists
-async function processPR(pr) {
-  const snapDir = path.join(outDir, 'prs');
-  const file = path.join(snapDir, `pr-${pr.number}.json`);
-  let data;
-
-  if (fsSync.existsSync(file)) {
-    const raw = await fs.readFile(file, 'utf-8');
-    data = JSON.parse(raw);
-    // Check if all diffs exist
-    if (!skipDiff && data.commitsMeta) {
-      const shas = data.commitsMeta.map(c => c.commit.oid);
-      const allDiffsExist = shas.every(sha => fsSync.existsSync(path.join(outDir, 'diffs', `${sha}.diff`)));
-      if (allDiffsExist) {
-        log('INFO', `PR#${pr.number} and all diffs already processed; skipping.`);
-        return;
-      }
+// Phase 1: Fetch and save all PR metadata
+async function fetchAndSaveAllPRs() {
+  await ensureDir(path.join(outDir, 'prs'));
+  const prs = await fetchAllPRs();
+  log('INFO', `Found ${prs.length} PRs`);
+  for (const pr of prs) {
+    try {
+      await checkRateLimit();
+      const [comments, reviewThreads, commitsMeta] = await Promise.all([
+        fetchConnection(pr.number, 'comments', 'id body createdAt author{login}'),
+        fetchConnection(pr.number, 'reviewThreads', 'comments(first:100){nodes{path diffHunk body createdAt author{login}}}'),
+        fetchConnection(pr.number, 'commits', 'commit{oid message committedDate}')
+      ]);
+      const reviewComments = reviewThreads.flatMap(t => t.comments.nodes);
+      const data = {
+        prNumber:   pr.number,
+        title:      pr.title,
+        body:       pr.body,
+        createdAt:  pr.createdAt,
+        labels:     pr.labels,
+        comments,
+        reviewComments,
+        commitsMeta
+      };
+      const file = path.join(outDir, 'prs', `pr-${pr.number}.json`);
+      await fs.writeFile(file, JSON.stringify(data, null, 2));
+      log('INFO', `Saved PR#${pr.number}`);
+    } catch (err) {
+      log('ERROR', `Failed to fetch/save PR#${pr.number}: ${err.message}`);
     }
-    log('INFO', `PR#${pr.number} snapshot exists; loading for diff`);
-  } else {
-    log('INFO', `Processing PR#${pr.number}`);
-    await checkRateLimit();
-    const [comments, reviewThreads, commitsMeta] = await Promise.all([
-      fetchConnection(pr.number, 'comments', 'id body createdAt author{login}'),
-      fetchConnection(pr.number, 'reviewThreads', 'comments(first:100){nodes{path diffHunk body createdAt author{login}}}'),
-      fetchConnection(pr.number, 'commits', 'commit{oid message committedDate}')
-    ]);
-    const reviewComments = reviewThreads.flatMap(t => t.comments.nodes);
-
-    data = {
-      prNumber:   pr.number,
-      title:      pr.title,
-      body:       pr.body,
-      createdAt:  pr.createdAt,
-      labels:     pr.labels,
-      comments,
-      reviewComments,
-      commitsMeta
-    };
-
-    await ensureDir(snapDir);
-    await fs.writeFile(file, JSON.stringify(data, null, 2));
-    log('INFO', `Saved PR#${pr.number}`);
   }
+}
 
-  if (!skipDiff && data.commitsMeta) {
+// Phase 2: Fetch all commit diffs for all PRs
+async function fetchAllDiffs() {
+  const prsDir = path.join(outDir, 'prs');
+  const diffDir = path.join(outDir, 'diffs');
+  await ensureDir(diffDir);
+  const files = fsSync.readdirSync(prsDir).filter(f => f.startsWith('pr-') && f.endsWith('.json'));
+  const limit = pLimit(concurrency);
+  for (const file of files) {
+    let data;
+    try {
+      data = JSON.parse(fsSync.readFileSync(path.join(prsDir, file), 'utf-8'));
+    } catch (err) {
+      log('ERROR', `Failed to read/parse ${file}: ${err.message}`);
+      continue;
+    }
+    if (!data.commitsMeta) continue;
     const shas = data.commitsMeta.map(c => c.commit.oid);
-    const dir = path.join(outDir, 'diffs');
-    await ensureDir(dir);
-    const limit = pLimit(concurrency);
-    await Promise.all(shas.map(sha => limit(() => fetchDiff(sha))));
+    await Promise.all(shas.map(sha => limit(async () => {
+      try {
+        await fetchDiff(sha);
+      } catch (err) {
+        log('ERROR', `Failed to fetch diff for ${sha} in ${file}: ${err.message}`);
+      }
+    })));
   }
 }
 
 (async () => {
   try {
-    await ensureDir(path.join(outDir, 'prs'));
-    const prs = await fetchAllPRs();
-    log('INFO', `Found ${prs.length} PRs`);
-
-    const limit = pLimit(Math.min(concurrency, 3));
-    await Promise.all(prs.map(pr => limit(() => processPR(pr))));
-
+    await fetchAndSaveAllPRs();
+    await fetchAllDiffs();
     log('INFO', 'All done.');
   } catch (err) {
     log('ERROR', err.message);
