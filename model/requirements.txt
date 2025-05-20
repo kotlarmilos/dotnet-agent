@@ -2,3 +2,9 @@ transformers>=4.35.0
 peft>=0.7.0
 datasets>=2.16.0
 bitsandbytes>=0.41.0
+sentence-transformers
+langchain
+faiss-cpu
+fastapi
+uvicorn
+langchain-community
