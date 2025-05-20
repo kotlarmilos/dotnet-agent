@@ -4,7 +4,7 @@ import subprocess
 from pathlib import Path
 from typing import List
 import json
-import argparse
+from tqdm import tqdm
 
 from sentence_transformers import SentenceTransformer
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -12,15 +12,11 @@ from langchain.schema import Document
 from langchain.embeddings.base import Embeddings
 from langchain_community.vectorstores import FAISS
 
-# Configuration
-BASE_DIR = Path(__file__).resolve().parent
-SETTINGS_PATH = BASE_DIR / 'settings.json'
-
-# Load settings
-with open(SETTINGS_PATH, 'r', encoding='utf-8') as f:
-    settings = json.load(f)
-
-EMBED_MODEL = settings['embed_model']
+def load_settings(path: Path):
+    if not path.exists():
+        print(f"Settings file not found: {path}", file=sys.stderr)
+        sys.exit(1)
+    return json.loads(path.read_text(encoding='utf-8'))
 
 def clone_repo(repo_url: str, local_path: Path) -> None:
     if not local_path.exists():
@@ -32,7 +28,8 @@ def clone_repo(repo_url: str, local_path: Path) -> None:
 
 def extract_repo_files(repo_path: Path) -> List[Document]:
     docs: List[Document] = []
-    for path in repo_path.rglob('*'):
+    all_files = [p for p in repo_path.rglob('*') if p.is_file()]
+    for path in tqdm(all_files, desc="Reading repo files"):
         try:
             text = path.read_text(encoding='utf-8', errors='ignore')
             docs.append(Document(page_content=text, metadata={'source': str(path)}))
@@ -73,15 +70,21 @@ def build_embeddings_index(
         print(f"FAISS index already exists at {index_path}.")
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Build embeddings index for a codebase using FAISS and SentenceTransformers.")
-    parser.add_argument('--repo-url', type=str, help='Git repository URL to clone')
-    parser.add_argument('--output', type=str, help='Output directory for the cloned repo and index')
-    args = parser.parse_args()
+def main():
+    # Configuration
+    BASE_DIR = Path(__file__).resolve().parent
+    SETTINGS_PATH = BASE_DIR.parent / 'settings.json'
 
-    repo_url = args.repo_url
-    local_repo = Path(args.output, 'repo')
-    vector_index_path = Path(args.output, 'faiss_index')
+    # Load settings
+    settings = load_settings(SETTINGS_PATH)
+
+    EMBED_MODEL = settings['embed_model']
+    OUT_DIR      = BASE_DIR.parent / 'data' / 'rag'
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    repo_url = settings['repository']
+    local_repo = OUT_DIR / 'repo'
+    vector_index_path = OUT_DIR / 'faiss_index'
 
     clone_repo(repo_url, local_repo)
     build_embeddings_index(local_repo, vector_index_path, EMBED_MODEL)
