@@ -9,6 +9,7 @@ import pRetry from 'p-retry';
 import { promisify } from 'util';
 import cliProgress from 'cli-progress';
 import settings from '../settings.json' assert { type: 'json' };
+import fetch from 'node-fetch';
 
 dotenv.config();
 const TOKEN = process.env.GITHUB_TOKEN;
@@ -210,12 +211,10 @@ async function fetchMissingDetails(pr) {
 
 async function fetchCommitDiff(owner, repo, sha) {
   await checkRateLimit();
-  const res = await withSmartRetry(() =>
-    octokit.request('GET /repos/{owner}/{repo}/commits/{sha}', {
-      owner, repo, sha
-    })
-  );
-  return res.data;
+  const url = `https://github.com/${owner}/${repo}/commit/${sha}.diff`;
+  const res = await withSmartRetry(() => fetch(url));
+  if (!res.ok) throw new Error(`Failed to fetch diff: ${res.status} ${res.statusText}`);
+  return await res.text();
 }
 
 async function main() {
@@ -256,12 +255,12 @@ async function main() {
 
     for (const entry of commits) {
       const sha = entry.commit.oid;
-      const diffFile = path.join(outDir, 'diffs', `${sha}.json`);
+      const diffFile = path.join(outDir, 'diffs', `${sha}.diff`);
       if (fsSync.existsSync(diffFile)) continue;
 
       try {
         const data = await fetchCommitDiff(owner, repo, sha);
-        await fs.writeFile(diffFile, JSON.stringify(data, null, 2));
+        await fs.writeFile(diffFile, data);
       } catch (err) {
         log('ERROR', `Failed to fetch diff for ${sha}: ${err.message}`);
       }
