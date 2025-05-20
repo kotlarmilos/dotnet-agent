@@ -51,10 +51,13 @@ function msToHMS(ms) {
 }
 
 async function waitForRateLimitReset() {
-  const { resetAt } = await getRateLimit();
-  const ms = Math.max(resetAt - Date.now(), 0);
-  log('WARN', `Rate limit hit; sleeping ${msToHMS(ms)}`);
-  await sleep(ms + 1000);
+  while (true) {
+    const { remaining, resetAt } = await getRateLimit();
+    if (remaining > 0) return;
+    const ms = Math.max(resetAt - Date.now(), 0);
+    log('WARN', `Rate limit hit; sleeping ${msToHMS(ms)}`);
+    await sleep(ms + 1000);
+  }
 }
 
 async function checkRateLimit(threshold = 10) {
@@ -72,7 +75,7 @@ async function withSmartRetry(fn) {
     factor: 2,
     minTimeout: 1000,
     maxTimeout: 30000,
-    onFailedAttempt: e => log('WARN', `Attempt #${e.attemptNumber} failed: ${e.status}`),
+    onFailedAttempt: e => log('WARN', `Attempt #${e.attemptNumber} failed: ${e.status || e.code || e.message}`),
     retry: e =>
       (/rate limit/i.test(e.message)) ||
       (e.status >= 500) ||

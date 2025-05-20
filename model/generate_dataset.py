@@ -20,9 +20,6 @@ def main():
 
     # Load settings
     BASE_DIR = Path(__file__).resolve().parent
-    settings = load_settings(BASE_DIR / 'settings.json')
-    model_name = settings.get('base_model')
-    max_context = settings.get('max_context_size')
 
     # Define directories
     SNAPSHOT_DIR = BASE_DIR.parent / 'data' / 'raw-data' / 'prs'
@@ -30,26 +27,33 @@ def main():
     OUT_DIR      = BASE_DIR.parent / 'data' / 'dataset'
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-
     for snapshot_path in sorted(SNAPSHOT_DIR.glob('pr-*.json')):
         pr_data = json.loads(snapshot_path.read_text(encoding='utf-8'))
-        pr_number = pr_data.get('prNumber')
+        pr_number = pr_data.get('number')
         if pr_number is None:
-            print(f"Skipping {snapshot_path.name}: missing prNumber")
+            print(f"Skipping {snapshot_path.name}: missing number")
             continue
 
         # Extract PR metadata
         repo           = 'dotnet/runtime'
         title          = pr_data.get('title', '')
         body           = pr_data.get('body', '')
+        created_at     = pr_data.get('createdAt', '')
+        closed_at      = pr_data.get('closedAt', '')
+        merged_at      = pr_data.get('mergedAt', '')
+        author         = pr_data.get('author', {}).get('login', '')
+        state          = pr_data.get('state', '')
+        additions      = pr_data.get('additions', 0)
+        deletions      = pr_data.get('deletions', 0)
+        changed_files  = pr_data.get('changedFiles', 0)
+        head_ref       = pr_data.get('headRefName', '')
         labels         = pr_data.get('labels', [])
         comments       = pr_data.get('comments', [])
-        review_comments= pr_data.get('reviewComments', [])
-        commits_meta   = pr_data.get('commitsMeta', [])
+        review_threads = pr_data.get('reviewThreads', [])
+        commits        = pr_data.get('commits', [])
 
         # Attach diffs
-        for cm in commits_meta:
+        for cm in commits.get('nodes', []):
             oid = cm.get('commit', {}).get('oid')
             if oid:
                 diff_file = DIFF_DIR / f"{oid}.diff"
@@ -58,13 +62,14 @@ def main():
 
         # Build sorted events
         events = []
-        for c in comments:
+        for c in comments.get('nodes', []):
             ts = c.get('createdAt')
             if ts: events.append(('comment', ts, c))
-        for rc in review_comments:
-            ts = rc.get('createdAt')
-            if ts: events.append(('review', ts, rc))
-        for cm in commits_meta:
+        for rc in review_threads.get('nodes', []):
+            for r in rc['comments'].get('nodes', []):
+                ts = r.get('createdAt')
+                if ts: events.append(('review', ts, r))
+        for cm in commits.get('nodes', []):
             ts = cm.get('commit', {}).get('committedDate')
             if ts: events.append(('commit', ts, cm))
         events.sort(key=lambda e: e[1])
@@ -76,14 +81,20 @@ def main():
                 oid         = commit_info.get('oid')
                 diff_text   = commit_info.get('diff', '')
                 commit_date = commit_info.get('committedDate', '')
-                commit_author = (commit_info.get('author') or {}).get('login', '')
+                commit_message = commit_info.get('message', '')
+
+                # Skip if commit file already exists
+                commit_file = OUT_DIR / f"commit-{oid}.jsonl"
+                if commit_file.exists():
+                    print(f"Skipping commit {oid}: file already exists.")
+                    continue
 
                 # Skip if commit diff is empty or not found
                 if not diff_text.strip():
                     print(f"Skipping commit {oid}: diff is empty or not found.")
                     continue
 
-                # Build user message (make prompt smaller)
+                # Build user message
                 user_parts = [
                     f"PR #{pr_number}: {title}",
                     f"Body: {body}",
@@ -126,35 +137,7 @@ def main():
                                 f"Review on {path}: {review_body}\nDiff:\n{hunk}"
                             )
                 prompt = "\n".join(user_parts)
-                completion = f"Commit {oid}\nDiff:\n{diff_text}"
-
-                # Tokenize prompt and completion separately
-                prompt_tokens = tokenizer.encode(prompt, truncation=False)
-                completion_tokens = tokenizer.encode(completion, truncation=False)
-                # If completion alone is above max_context, skip
-                if len(completion_tokens) > max_context:
-                    print(f"Skipping commit {oid}: completion length = {len(completion_tokens)} tokens > {max_context}")
-                    continue
-                # If total is above max_context, truncate prompt from the start
-                total_tokens = len(prompt_tokens) + len(completion_tokens)
-                if total_tokens > max_context:
-                    # Truncate prompt tokens from the start
-                    num_prompt_tokens_allowed = max_context - len(completion_tokens)
-                    if num_prompt_tokens_allowed > 0:
-                        truncated_prompt_tokens = prompt_tokens[-num_prompt_tokens_allowed:]
-                        truncated_prompt = tokenizer.decode(truncated_prompt_tokens, skip_special_tokens=True)
-                        prompt = truncated_prompt
-                    else:
-                        print(f"Skipping commit {oid}: not enough room for prompt after reserving completion tokens.")
-                        continue
-
-                # Another option is to rebuild input with system instruction manually
-                # system_instruction = settings['system_instruction']
-                # text = (
-                #     "<|im_start|>system\n<|im_sep|>" + system_instruction + "\n<|im_end|>\n"
-                #     "<|im_start|>user\n<|im_sep|>"   + prompt + "\n<|im_end|>\n"
-                #     "<|im_start|>assistant\n<|im_sep|>" + completion + "\n<|im_end|>"
-                # )
+                completion = f"Commit {oid} - {commit_message}\nDiff:\n{diff_text}"
 
                 row = {
                     'prompt': prompt,
@@ -162,14 +145,33 @@ def main():
                 }
                 if repo:
                     row['repo'] = repo
-                if commit_author:
-                    row['author'] = commit_author
-                if commit_date:
-                    row['date'] = commit_date
-                if oid:
-                    row['id'] = oid
+                if pr_number:
+                    row['pr_number'] = pr_number
+                if title:
+                    row['title'] = title
+                if body:
+                    row['body'] = body
+                if created_at:
+                    row['created_at'] = created_at
+                if closed_at:
+                    row['closed_at'] = closed_at
+                if merged_at:
+                    row['merged_at'] = merged_at
+                if author:
+                    row['author'] = author
+                if state:
+                    row['state'] = state
+                if additions:
+                    row['additions'] = additions
+                if deletions:
+                    row['deletions'] = deletions
+                if changed_files:
+                    row['changed_files'] = changed_files
+                if head_ref:
+                    row['head_ref'] = head_ref
                 if labels:
-                    row['labels'] = ','.join(labels)
+                    row['labels'] = ", ".join(labels)
+                row['completion_commit'] = oid
                 # Write out per-commit file
                 commit_out_file = OUT_DIR / f"commit-{oid}.{output_format}"
                 if output_format == 'jsonl':
