@@ -21,7 +21,6 @@ def main():
     # Load settings
     BASE_DIR = Path(__file__).resolve().parent
     settings = load_settings(BASE_DIR / 'settings.json')
-    system_instruction = settings['system_instruction']
     model_name = settings.get('base_model')
     max_context = settings.get('max_context_size')
 
@@ -38,11 +37,6 @@ def main():
         pr_number = pr_data.get('prNumber')
         if pr_number is None:
             print(f"Skipping {snapshot_path.name}: missing prNumber")
-            continue
-
-        out_file = OUT_DIR / f"pr-{pr_number}.{output_format}"
-        if out_file.exists():
-            print(f"Skipping PR #{pr_number} (already exists)")
             continue
 
         # Extract PR metadata
@@ -76,9 +70,6 @@ def main():
         events.sort(key=lambda e: e[1])
 
         past = []
-        lines = []
-        csv_rows = []
-
         for kind, ts, data in events:
             if kind == 'commit':
                 commit_info = data['commit']
@@ -156,12 +147,14 @@ def main():
                     else:
                         print(f"Skipping commit {oid}: not enough room for prompt after reserving completion tokens.")
                         continue
-                # Rebuild text with possibly truncated prompt
-                text = (
-                    "<|im_start|>system\n<|im_sep|>" + system_instruction + "\n<|im_end|>\n"
-                    "<|im_start|>user\n<|im_sep|>"   + prompt + "\n<|im_end|>\n"
-                    "<|im_start|>assistant\n<|im_sep|>" + completion + "\n<|im_end|>"
-                )
+
+                # Another option is to rebuild input with system instruction manually
+                # system_instruction = settings['system_instruction']
+                # text = (
+                #     "<|im_start|>system\n<|im_sep|>" + system_instruction + "\n<|im_end|>\n"
+                #     "<|im_start|>user\n<|im_sep|>"   + prompt + "\n<|im_end|>\n"
+                #     "<|im_start|>assistant\n<|im_sep|>" + completion + "\n<|im_end|>"
+                # )
 
                 row = {
                     'prompt': prompt,
@@ -177,23 +170,17 @@ def main():
                     row['id'] = oid
                 if labels:
                     row['labels'] = ','.join(labels)
+                # Write out per-commit file
+                commit_out_file = OUT_DIR / f"commit-{oid}.{output_format}"
                 if output_format == 'jsonl':
-                    lines.append(json.dumps(row, ensure_ascii=False))
+                    commit_out_file.write_text(json.dumps(row, ensure_ascii=False) + "\n", encoding='utf-8')
                 elif output_format == 'csv':
-                    csv_rows.append(row)
+                    fieldnames = list(row.keys())
+                    with commit_out_file.open('w', encoding='utf-8', newline='') as f:
+                        writer = csv.DictWriter(f, fieldnames=fieldnames)
+                        writer.writeheader()
+                        writer.writerow(row)
             past.append((kind, ts, data))
-
-        if output_format == 'jsonl' and lines:
-            out_file.write_text("\n".join(lines) + "\n", encoding='utf-8')
-            print(f"Generated {len(lines)} examples for PR #{pr_number} (jsonl)")
-        elif output_format == 'csv' and csv_rows:
-            # Dynamically determine fieldnames from the first row
-            fieldnames = list(csv_rows[0].keys()) if csv_rows else ['prompt', 'completion']
-            with out_file.open('w', encoding='utf-8', newline='') as f:
-                writer = csv.DictWriter(f, fieldnames=fieldnames)
-                writer.writeheader()
-                writer.writerows(csv_rows)
-            print(f"Generated {len(csv_rows)} examples for PR #{pr_number} (csv)")
 
 if __name__ == "__main__":
     main()
