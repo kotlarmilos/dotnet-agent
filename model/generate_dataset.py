@@ -5,6 +5,7 @@ import sys
 from transformers import AutoTokenizer
 import argparse
 import csv
+from tqdm import tqdm
 
 def load_settings(path: Path):
     if not path.exists():
@@ -27,7 +28,9 @@ def main():
     OUT_DIR      = BASE_DIR.parent / 'data' / 'dataset'
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    for snapshot_path in sorted(SNAPSHOT_DIR.glob('pr-*.json')):
+    snapshot_files = sorted(SNAPSHOT_DIR.glob('pr-*.json'))
+    total_snapshots = len(snapshot_files)
+    for idx, snapshot_path in enumerate(tqdm(snapshot_files, desc="Processing PRs")):
         pr_data = json.loads(snapshot_path.read_text(encoding='utf-8'))
         pr_number = pr_data.get('number')
         if pr_number is None:
@@ -86,12 +89,12 @@ def main():
                 # Skip if commit file already exists
                 commit_file = OUT_DIR / f"commit-{oid}.jsonl"
                 if commit_file.exists():
-                    print(f"Skipping commit {oid}: file already exists.")
+                    # print(f"Skipping commit {oid}: file already exists.")
                     continue
 
                 # Skip if commit diff is empty or not found
                 if not diff_text.strip():
-                    print(f"Skipping commit {oid}: diff is empty or not found.")
+                    # print(f"Skipping commit {oid}: diff is empty or not found.")
                     continue
 
                 # Build user message
