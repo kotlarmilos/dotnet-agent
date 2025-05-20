@@ -32,7 +32,20 @@ async function ensureDir(dir) {
   await fs.mkdir(dir, { recursive: true });
 }
 
-async function getRateLimit() {
+// Returns the GraphQL rate limit status
+async function getGraphqlRateLimit() {
+  const query = `query { rateLimit { limit cost remaining resetAt nodeCount } }`;
+  const resp = await gh(query);
+  const rl = resp.rateLimit;
+  return {
+    remaining: rl.remaining,
+    resetAt: new Date(rl.resetAt).getTime(),
+    window: new Date(rl.resetAt).getTime() - Date.now()
+  };
+}
+
+// Returns the REST rate limit status
+async function getRestRateLimit() {
   const { data } = await octokit.rest.rateLimit.get();
   const core = data.resources.core;
   return {
@@ -50,27 +63,33 @@ function msToHMS(ms) {
   return `${h}h ${m}m ${sec}s`;
 }
 
-async function waitForRateLimitReset() {
+// Update waitForRateLimitReset to accept mode
+async function waitForRateLimitReset(mode = 'rest') {
   while (true) {
-    const { remaining, resetAt } = await getRateLimit();
-    if (remaining > 0) return;
-    const ms = Math.max(resetAt - Date.now(), 0);
-    log('WARN', `Rate limit hit; sleeping ${msToHMS(ms)}`);
+    const rl = mode === 'graphql' ? await getGraphqlRateLimit() : await getRestRateLimit();
+    if (rl.remaining > 0) return;
+    const ms = Math.max(rl.resetAt - Date.now(), 0);
+    log('WARN', `Rate limit hit (${mode.toUpperCase()}); sleeping ${msToHMS(ms)}`);
     await sleep(ms + 1000);
   }
 }
 
-async function checkRateLimit(threshold = 10) {
-  const { remaining, resetAt } = await getRateLimit();
-  if (remaining < threshold) {
-    const ms = Math.max(resetAt - Date.now(), 0);
-    log('WARN', `Approaching rate limit (${remaining} left); sleeping ${msToHMS(ms)}`);
+// Update checkRateLimit to accept a mode
+async function checkRateLimit(threshold = 10, mode = 'rest') {
+  const rl = mode === 'graphql' ? await getGraphqlRateLimit() : await getRestRateLimit();
+  if (rl.remaining < threshold) {
+    const ms = Math.max(rl.resetAt - Date.now(), 0);
+    log('WARN', `Approaching ${mode.toUpperCase()} rate limit (${rl.remaining} left); sleeping ${msToHMS(ms)}`);
     await sleep(ms + 1000);
   }
 }
 
-async function withSmartRetry(fn) {
-  return pRetry(fn, {
+// In withSmartRetry, allow passing mode
+async function withSmartRetry(fn, mode = 'rest') {
+  return pRetry(async () => {
+    await checkRateLimit(10, mode);
+    return fn();
+  }, {
     retries: 5,
     factor: 2,
     minTimeout: 1000,
@@ -83,12 +102,13 @@ async function withSmartRetry(fn) {
   });
 }
 
+// In callGh, use 'graphql' mode
 async function callGh(query, vars) {
   try {
     return await gh(query, vars);
   } catch (err) {
     if (/rate limit/i.test(err.message)) {
-      await waitForRateLimitReset();
+      await waitForRateLimitReset('graphql');
       return await gh(query, vars);
     }
     throw err;
@@ -97,9 +117,7 @@ async function callGh(query, vars) {
 
 const STATE_FILE = path.join(outDir, 'state.json');
 let state = { prsDone: [], diffsDone: [], errors: [] };
-try {
-  state = JSON.parse(fsSync.readFileSync(STATE_FILE, 'utf-8'));
-} catch {}
+try { state = JSON.parse(fsSync.readFileSync(STATE_FILE, 'utf-8')); } catch {}
 function saveState() {
   fsSync.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
 }
@@ -121,7 +139,7 @@ async function fetchConnection(owner, repo, prNumber, field, selection) {
          }`,
         { owner, repo, pr: prNumber, first: 100, after: cursor }
       )
-    );
+    , 'graphql');
     const conn = resp.repository.pullRequest[field];
     nodes.push(...conn.nodes);
     cursor = conn.pageInfo.hasNextPage ? conn.pageInfo.endCursor : null;
@@ -131,7 +149,10 @@ async function fetchConnection(owner, repo, prNumber, field, selection) {
 
 async function fetchAllPRs(owner, repo, limit) {
   if (!state.cursor) {
-    const repoInfo = await callGh(`query($owner:String!,$repo:String!){repository(owner:$owner,name:$repo){pullRequests{totalCount}}}`, { owner, repo });
+    const repoInfo = await callGh(
+      `query($owner:String!,$repo:String!){repository(owner:$owner,name:$repo){pullRequests{totalCount}}}`,
+      { owner, repo }
+    );
     state.totalPRs = limit ? Math.min(limit, repoInfo.repository.pullRequests.totalCount) : repoInfo.repository.pullRequests.totalCount;
     state.cursor = null;
     state.processedPRs = 0;
@@ -139,12 +160,14 @@ async function fetchAllPRs(owner, repo, limit) {
     state.prsPending = [];
     saveState();
   }
+
   const bar = new cliProgress.SingleBar({
     format: 'Fetching PRs |{bar}| {value}/{total} PRs',
     hideCursor: true
   }, cliProgress.Presets.shades_classic);
   bar.start(limit ? Math.min(limit, state.totalPRs) : state.totalPRs, state.processedPRs);
-  while (state.processedPRs < limit && (state.cursor || state.processedPRs === 0)) {  
+
+  while (state.processedPRs < limit && (state.cursor || state.processedPRs === 0)) {
     const resp = await withSmartRetry(() =>
       callGh(
         `query($owner:String!,$repo:String!,$first:Int!,$after:String){
@@ -164,26 +187,30 @@ async function fetchAllPRs(owner, repo, limit) {
          }`,
         { owner, repo, first: 100, after: state.cursor }
       )
-    );
+    , 'graphql');
+
     const conn = resp.repository.pullRequests;
     for (const pr of conn.nodes) {
       const prFile = path.join(outDir, 'prs', `pr-${pr.number}.json`);
       if (!fsSync.existsSync(prFile)) {
         await fs.writeFile(prFile, JSON.stringify(pr, null, 2));
-      if (pr.comments.totalCount == pr.comments.nodes.length
-          && pr.reviewThreads.totalCount == pr.reviewThreads.nodes.length
-          && pr.commits.totalCount == pr.commits.nodes.length) {
-            state.prsCompleted.push(pr.number);
-          }else {
-            state.prsPending.push(pr.number);
-          }
+        if (
+          pr.comments.totalCount === pr.comments.nodes.length &&
+          pr.reviewThreads.totalCount === pr.reviewThreads.nodes.length &&
+          pr.commits.totalCount === pr.commits.nodes.length
+        ) {
+          state.prsCompleted.push(pr.number);
+        } else {
+          state.prsPending.push(pr.number);
+        }
       }
     }
+
     state.processedPRs += conn.nodes.length;
     state.cursor = conn.pageInfo.hasNextPage ? conn.pageInfo.endCursor : null;
     saveState();
     bar.update(state.processedPRs);
-  };
+  }
   bar.stop();
 }
 
@@ -195,27 +222,23 @@ async function fetchMissingDetails(pr) {
   const reviewCount  = prData.reviewThreads?.totalCount || 0;
   const commitCount  = prData.commits?.totalCount || 0;
 
-  const fetchedCommentCount = prData.comments?.nodes?.length || 0;
-  const fetchedReviewCount  = prData.reviewThreads?.nodes?.length || 0;
-  const fetchedCommitCount  = prData.commits?.nodes?.length || 0;
-
-  if (fetchedCommentCount < commentCount) {
-    prData.comments.nodes = await fetchConnection(owner, repo, pr.number, 'comments', 'body createdAt');
+  if ((prData.comments?.nodes?.length || 0) < commentCount) {
+    prData.comments.nodes = await fetchConnection(owner, repo, pr, 'comments', 'body createdAt');
   }
-  if (fetchedReviewCount < reviewCount) {
-    prData.reviewThreads.nodes = await fetchConnection(owner, repo, pr.number, 'reviewThreads', 'comments(first:100) { nodes { path diffHunk body createdAt } }');
+  if ((prData.reviewThreads?.nodes?.length || 0) < reviewCount) {
+    prData.reviewThreads.nodes = await fetchConnection(owner, repo, pr, 'reviewThreads', 'comments(first:100) { nodes { path diffHunk body createdAt } }');
   }
-  if (fetchedCommitCount < commitCount) {
-    prData.commits.nodes = await fetchConnection(owner, repo, pr.number, 'commits', 'commit { oid message committedDate }');
+  if ((prData.commits?.nodes?.length || 0) < commitCount) {
+    prData.commits.nodes = await fetchConnection(owner, repo, pr, 'commits', 'commit { oid message committedDate }');
   }
 
   await fs.writeFile(outFile, JSON.stringify(prData, null, 2));
 }
 
 async function fetchCommitDiff(owner, repo, sha) {
-  await checkRateLimit();
+  await waitForRateLimitReset('rest');
   const url = `https://github.com/${owner}/${repo}/commit/${sha}.diff`;
-  const res = await withSmartRetry(() => fetch(url));
+  const res = await withSmartRetry(() => fetch(url), 'rest');
   if (!res.ok) throw new Error(`Failed to fetch diff: ${res.status} ${res.statusText}`);
   return await res.text();
 }
@@ -272,7 +295,6 @@ async function main() {
     saveState();
     bar.increment();
   }
-
   bar.stop();
 
   log('INFO', 'All phases complete.');
