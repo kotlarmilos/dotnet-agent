@@ -28,7 +28,8 @@ def clone_repo(repo_url: str, local_path: Path) -> None:
 
 def extract_repo_files(repo_path: Path) -> List[Document]:
     docs: List[Document] = []
-    all_files = [p for p in repo_path.rglob('*') if p.is_file()]
+    allowed_extensions = {'.cs', '.cpp', '.c', '.h', '.hpp'}
+    all_files = [p for p in repo_path.rglob('*') if p.is_file() and p.suffix in allowed_extensions]
     for path in tqdm(all_files, desc="Reading repo files"):
         try:
             text = path.read_text(encoding='utf-8', errors='ignore')
