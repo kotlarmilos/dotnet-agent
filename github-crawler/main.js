@@ -4,7 +4,6 @@ import { graphql } from '@octokit/graphql';
 import fs from 'fs/promises';
 import fsSync from 'fs';
 import path from 'path';
-import pLimit from 'p-limit';
 import pRetry from 'p-retry';
 import { promisify } from 'util';
 import cliProgress from 'cli-progress';
@@ -40,7 +39,8 @@ async function getGraphqlRateLimit() {
   return {
     remaining: rl.remaining,
     resetAt: new Date(rl.resetAt).getTime(),
-    window: new Date(rl.resetAt).getTime() - Date.now()
+    window: new Date(rl.resetAt).getTime() - Date.now(),
+    cost: rl.cost || 1
   };
 }
 
@@ -63,31 +63,19 @@ function msToHMS(ms) {
   return `${h}h ${m}m ${sec}s`;
 }
 
-// Update waitForRateLimitReset to accept mode
-async function waitForRateLimitReset(mode = 'rest') {
+async function waitForRateLimitReset(mode = 'rest', expectedCost = 1) {
   while (true) {
     const rl = mode === 'graphql' ? await getGraphqlRateLimit() : await getRestRateLimit();
-    if (rl.remaining > 0) return;
+    if (rl.remaining >= expectedCost) return;
     const ms = Math.max(rl.resetAt - Date.now(), 0);
     log('WARN', `Rate limit hit (${mode.toUpperCase()}); sleeping ${msToHMS(ms)}`);
     await sleep(ms + 1000);
   }
 }
 
-// Update checkRateLimit to accept a mode
-async function checkRateLimit(threshold = 10, mode = 'rest') {
-  const rl = mode === 'graphql' ? await getGraphqlRateLimit() : await getRestRateLimit();
-  if (rl.remaining < threshold) {
-    const ms = Math.max(rl.resetAt - Date.now(), 0);
-    log('WARN', `Approaching ${mode.toUpperCase()} rate limit (${rl.remaining} left); sleeping ${msToHMS(ms)}`);
-    await sleep(ms + 1000);
-  }
-}
-
-// In withSmartRetry, allow passing mode
-async function withSmartRetry(fn, mode = 'rest') {
+async function withSmartRetry(fn, mode = 'rest', expectedCost = 1) {
   return pRetry(async () => {
-    await checkRateLimit(10, mode);
+    await waitForRateLimitReset(mode, expectedCost);
     return fn();
   }, {
     retries: 5,
@@ -102,7 +90,6 @@ async function withSmartRetry(fn, mode = 'rest') {
   });
 }
 
-// In callGh, use 'graphql' mode
 async function callGh(query, vars) {
   try {
     return await gh(query, vars);
@@ -139,7 +126,7 @@ async function fetchConnection(owner, repo, prNumber, field, selection) {
          }`,
         { owner, repo, pr: prNumber, first: 100, after: cursor }
       )
-    , 'graphql');
+    , 'graphql', 100);
     const conn = resp.repository.pullRequest[field];
     nodes.push(...conn.nodes);
     cursor = conn.pageInfo.hasNextPage ? conn.pageInfo.endCursor : null;
@@ -187,7 +174,7 @@ async function fetchAllPRs(owner, repo, limit) {
          }`,
         { owner, repo, first: 100, after: state.cursor }
       )
-    , 'graphql');
+    , 'graphql', 100);
 
     const conn = resp.repository.pullRequests;
     for (const pr of conn.nodes) {

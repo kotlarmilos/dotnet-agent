@@ -1,191 +1,147 @@
 #!/usr/bin/env python3
 import json
 from pathlib import Path
-import sys
-from transformers import AutoTokenizer
-import argparse
-import csv
-from tqdm import tqdm
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
-def load_settings(path: Path):
-    if not path.exists():
-        print(f"Settings file not found: {path}", file=sys.stderr)
-        sys.exit(1)
-    return json.loads(path.read_text(encoding='utf-8'))
-
-def main():
-    parser = argparse.ArgumentParser(description="Generate dataset for fine-tuning.")
-    parser.add_argument('--output', choices=['jsonl', 'csv'], default='jsonl', help='Output format: jsonl or csv (default: jsonl)')
-    args = parser.parse_args()
-    output_format = args.output
-
-    # Load settings
-    BASE_DIR = Path(__file__).resolve().parent
-
-    # Define directories
-    SNAPSHOT_DIR = BASE_DIR.parent / 'data' / 'raw-data' / 'prs'
-    DIFF_DIR     = BASE_DIR.parent / 'data' / 'raw-data' / 'diffs'
-    OUT_DIR      = BASE_DIR.parent / 'data' / 'dataset'
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-
-    snapshot_files = sorted(SNAPSHOT_DIR.glob('pr-*.json'))
-    total_snapshots = len(snapshot_files)
-    for idx, snapshot_path in enumerate(tqdm(snapshot_files, desc="Processing PRs")):
-        pr_data = json.loads(snapshot_path.read_text(encoding='utf-8'))
-        pr_number = pr_data.get('number')
+def iter_commit_rows(snapshot_dir: Path, diff_dir: Path, repo: str):
+    # Generator yielding single-row dicts
+    for snapshot_path in sorted(snapshot_dir.glob('pr-*.json')):
+        pr = json.loads(snapshot_path.read_text(encoding='utf-8'))
+        pr_number = pr.get('number')
         if pr_number is None:
-            print(f"Skipping {snapshot_path.name}: missing number")
             continue
 
-        # Extract PR metadata
-        repo           = 'dotnet/runtime'
-        title          = pr_data.get('title', '')
-        body           = pr_data.get('body', '')
-        created_at     = pr_data.get('createdAt', '')
-        closed_at      = pr_data.get('closedAt', '')
-        merged_at      = pr_data.get('mergedAt', '')
-        author         = pr_data.get('author', {}).get('login', '')
-        state          = pr_data.get('state', '')
-        additions      = pr_data.get('additions', 0)
-        deletions      = pr_data.get('deletions', 0)
-        changed_files  = pr_data.get('changedFiles', 0)
-        head_ref       = pr_data.get('headRefName', '')
-        labels         = pr_data.get('labels', [])
-        comments       = pr_data.get('comments', [])
-        review_threads = pr_data.get('reviewThreads', [])
-        commits        = pr_data.get('commits', [])
-
-        # Attach diffs
-        for cm in commits.get('nodes', []):
-            oid = cm.get('commit', {}).get('oid')
+        commits = pr.get('commits', {}).get('nodes', [])
+        for node in commits:
+            commit = node.get('commit', {})
+            oid = commit.get('oid')
             if oid:
-                diff_file = DIFF_DIR / f"{oid}.diff"
-                if diff_file.exists():
-                    cm['commit']['diff'] = diff_file.read_text(encoding='utf-8').strip()
+                diff_file = diff_dir / f"{oid}.diff"
+                commit['diff'] = diff_file.read_text(encoding='utf-8').strip() if diff_file.exists() else ''
 
-        # Build sorted events
         events = []
-        for c in comments.get('nodes', []):
+        # collect events
+        for c in pr.get('comments', {}).get('nodes', []):
             ts = c.get('createdAt')
             if ts: events.append(('comment', ts, c))
-        for rc in review_threads.get('nodes', []):
-            for r in rc['comments'].get('nodes', []):
+        for rt in pr.get('reviewThreads', {}).get('nodes', []):
+            for r in rt.get('comments', {}).get('nodes', []):
                 ts = r.get('createdAt')
                 if ts: events.append(('review', ts, r))
-        for cm in commits.get('nodes', []):
-            ts = cm.get('commit', {}).get('committedDate')
-            if ts: events.append(('commit', ts, cm))
+        for node in commits:
+            ts = node.get('commit', {}).get('committedDate')
+            if ts: events.append(('commit', ts, node))
         events.sort(key=lambda e: e[1])
 
-        past = []
+        history = []
         for kind, ts, data in events:
-            if kind == 'commit':
-                commit_info = data['commit']
-                oid         = commit_info.get('oid')
-                diff_text   = commit_info.get('diff', '')
-                commit_date = commit_info.get('committedDate', '')
-                commit_message = commit_info.get('message', '')
+            history.append((kind, ts, data))
+            if kind != 'commit':
+                continue
 
-                # Skip if commit file already exists
-                commit_file = OUT_DIR / f"commit-{oid}.jsonl"
-                if commit_file.exists():
-                    # print(f"Skipping commit {oid}: file already exists.")
-                    continue
+            c = data['commit']
+            oid = c.get('oid')
+            diff_text = c.get('diff', '')
+            msg = c.get('message', '')
+            if not oid or not diff_text.strip():
+                continue
 
-                # Skip if commit diff is empty or not found
-                if not diff_text.strip():
-                    # print(f"Skipping commit {oid}: diff is empty or not found.")
-                    continue
+            # build prompt
+            prompt_parts = [
+                f"Title: {pr.get('title', '')}",
+                f"Body: {pr.get('body', '')}",
+            ]
+            labels = pr.get('labels') or []
+            if labels:
+                prompt_parts.append("Labels: " + ", ".join(labels))
 
-                # Build user message
-                user_parts = [
-                    f"PR #{pr_number}: {title}",
-                    f"Body: {body}",
-                ]
-                if labels:
-                    user_parts.append("Labels: " + ", ".join(labels))
-                # Find the last commit before the current one
-                last_commit_idx = None
-                for idx in range(len(past)-1, -1, -1):
-                    if past[idx][0] == 'commit':
-                        last_commit_idx = idx
-                        break
-                    
-                # Gather events between last commit and this commit
-                events_between = past[last_commit_idx+1:] if last_commit_idx is not None else past
-                # Add last commit info if it exists before current commit
-                if last_commit_idx is not None:
-                    prev_commit_event = past[last_commit_idx]
-                    prev_commit_info = (prev_commit_event[2] or {}).get('commit', {})
-                    prev_oid = prev_commit_info.get('oid', '')
-                    prev_message = prev_commit_info.get('message', '')
-                    prev_diff = prev_commit_info.get('diff', '')
-                    prev_date = prev_commit_info.get('committedDate', '')
-                    if prev_date and commit_date and prev_date < commit_date:
-                        user_parts.append(
-                            f"Last commit {prev_oid} – {prev_message}\nDiff:\n{prev_diff}"
-                        )
-                # Add all comments and reviews between last commit and this commit
-                for pkind, _, pdat in events_between:
-                    if pkind == 'comment':
-                        comment_body = pdat.get('body', '') if pdat else ''
-                        if comment_body.strip():
-                            user_parts.append(f"Comment: {comment_body}")
-                    elif pkind == 'review':
-                        path   = (pdat or {}).get('path', '')
-                        hunk   = ((pdat or {}).get('diffHunk') or '').strip()
-                        review_body = (pdat or {}).get('body', '')
-                        if review_body.strip() or hunk:
-                            user_parts.append(
-                                f"Review on {path}: {review_body}\nDiff:\n{hunk}"
-                            )
-                prompt = "\n".join(user_parts)
-                completion = f"Commit {oid} - {commit_message}\nDiff:\n{diff_text}"
+            # events since last commit
+            last_idx = next((i for i in range(len(history)-2, -1, -1) if history[i][0] == 'commit'), None)
+            seg = history[last_idx+1:-1] if last_idx is not None else history[:-1]
+            if last_idx is not None:
+                prev = history[last_idx][2]['commit']
+                prompt_parts.append(
+                    f"Last commit: {prev.get('message')}\nDiff:\n{prev.get('diff', '')}"
+                )
 
-                row = {
-                    'prompt': prompt,
-                    'completion': completion
-                }
-                if repo:
-                    row['repo'] = repo
-                if pr_number:
-                    row['pr_number'] = pr_number
-                if title:
-                    row['title'] = title
-                if body:
-                    row['body'] = body
-                if created_at:
-                    row['created_at'] = created_at
-                if closed_at:
-                    row['closed_at'] = closed_at
-                if merged_at:
-                    row['merged_at'] = merged_at
-                if author:
-                    row['author'] = author
-                if state:
-                    row['state'] = state
-                if additions:
-                    row['additions'] = additions
-                if deletions:
-                    row['deletions'] = deletions
-                if changed_files:
-                    row['changed_files'] = changed_files
-                if head_ref:
-                    row['head_ref'] = head_ref
-                if labels:
-                    row['labels'] = ", ".join(labels)
-                row['completion_commit'] = oid
-                # Write out per-commit file
-                commit_out_file = OUT_DIR / f"commit-{oid}.{output_format}"
-                if output_format == 'jsonl':
-                    commit_out_file.write_text(json.dumps(row, ensure_ascii=False) + "\n", encoding='utf-8')
-                elif output_format == 'csv':
-                    fieldnames = list(row.keys())
-                    with commit_out_file.open('w', encoding='utf-8', newline='') as f:
-                        writer = csv.DictWriter(f, fieldnames=fieldnames)
-                        writer.writeheader()
-                        writer.writerow(row)
-            past.append((kind, ts, data))
+            for ekind, _, edata in seg:
+                if ekind == 'comment':
+                    body = edata.get('body', '').strip()
+                    if body:
+                        prompt_parts.append(f"Comment: {body}")
+                elif ekind == 'review':
+                    path = edata.get('path', '')
+                    review_body = edata.get('body', '').strip()
+                    hunk = (edata.get('diffHunk') or '').strip()
+                    prompt_parts.append(
+                        f"Review on {path}: {review_body}\nDiff:\n{hunk}"
+                    )
 
-if __name__ == "__main__":
+            yield {
+                'prompt': '\n'.join(prompt_parts),
+                'completion': f"Diff:\n{diff_text}",
+                'repo': repo,
+                'pr_number': pr_number,
+                'title': pr.get('title', ''),
+                'body': pr.get('body', ''),
+                'created_at': pr.get('createdAt', ''),
+                'closed_at': pr.get('closedAt', ''),
+                'merged_at': pr.get('mergedAt', ''),
+                'author': pr.get('author', {}).get('login', ''),
+                'state': pr.get('state', ''),
+                'additions': pr.get('additions', 0),
+                'deletions': pr.get('deletions', 0),
+                'changed_files': pr.get('changedFiles', 0),
+                'head_ref': pr.get('headRefName', ''),
+                'labels': ", ".join(labels),
+                'completion_commit': oid,
+            }
+
+def main():
+    BASE_DIR = Path(__file__).resolve().parent
+    snapshot_dir = BASE_DIR.parent / 'data' / 'raw-data' / 'prs'
+    diff_dir = BASE_DIR.parent / 'data' / 'raw-data' / 'diffs'
+    dataset_dir = BASE_DIR.parent / 'data' / 'dataset'
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+
+    # define schema
+    schema = pa.schema([
+        ('prompt', pa.string()),
+        ('completion', pa.string()),
+        ('repo', pa.string()),
+        ('pr_number', pa.int64()),
+        ('title', pa.string()),
+        ('body', pa.string()),
+        ('created_at', pa.string()),
+        ('closed_at', pa.string()),
+        ('merged_at', pa.string()),
+        ('author', pa.string()),
+        ('state', pa.string()),
+        ('additions', pa.int64()),
+        ('deletions', pa.int64()),
+        ('changed_files', pa.int64()),
+        ('head_ref', pa.string()),
+        ('labels', pa.string()),
+        ('completion_commit', pa.string()),
+    ])
+
+    train_writer = pq.ParquetWriter(str(dataset_dir / 'train.parquet'), schema)
+    test_writer  = pq.ParquetWriter(str(dataset_dir / 'test.parquet'), schema)
+
+    for row in iter_commit_rows(snapshot_dir, diff_dir, 'dotnet/runtime'):
+        table = pa.Table.from_pydict({k: [v] for k, v in row.items()}, schema)
+        # route by hash of commit ID
+        if hash(row['completion_commit']) % 5 == 0:
+            test_writer.write_table(table)
+        else:
+            train_writer.write_table(table)
+
+    train_writer.close()
+    test_writer.close()
+
+    print(f"Wrote train.parquet and test.parquet to {dataset_dir}")
+
+if __name__ == '__main__':
     main()

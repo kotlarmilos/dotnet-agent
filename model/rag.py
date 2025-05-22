@@ -89,6 +89,5 @@ def main():
     clone_repo(repo_url, local_repo)
     build_embeddings_index(local_repo, vector_index_path, EMBED_MODEL)
 
-
 if __name__ == '__main__':
     main()
