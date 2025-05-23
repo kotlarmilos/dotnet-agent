@@ -79,6 +79,7 @@ def iter_commit_rows(snapshot_dir: Path, diff_dir: Path, repo: str):
                         f"Review on {path}: {review_body}\nDiff:\n{hunk}"
                     )
 
+            author = c.get('author', {}) or {}
             yield {
                 'prompt': '\n'.join(prompt_parts),
                 'completion': f"Diff:\n{diff_text}",
@@ -89,7 +90,7 @@ def iter_commit_rows(snapshot_dir: Path, diff_dir: Path, repo: str):
                 'created_at': pr.get('createdAt', ''),
                 'closed_at': pr.get('closedAt', ''),
                 'merged_at': pr.get('mergedAt', ''),
-                'author': pr.get('author', {}).get('login', ''),
+                'author': author.get('login', ''),
                 'state': pr.get('state', ''),
                 'additions': pr.get('additions', 0),
                 'deletions': pr.get('deletions', 0),
